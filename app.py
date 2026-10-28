@@ -1,7 +1,12 @@
+import hashlib
+import os
+
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+
+from book_metadata import enrich_books
 
 # Chart styling: one hue for single-series charts, quiet ink for text and axes
 BAR_COLOR = "#2a78d6"
@@ -160,6 +165,79 @@ def plot_avg_rating_by_author(read, min_books):
     return fig
 
 
+def explode_tags(read, column):
+    """One row per (book, tag); books without tags are dropped."""
+    exploded = read[["My Rating", column]].explode(column)
+    return exploded[exploded[column].notna() & (exploded[column] != "")]
+
+
+def plot_top_tags(read, column, title, n=12):
+    tags = explode_tags(read, column)
+    if tags.empty:
+        return None
+    tagged_books = read[column].map(len).gt(0).sum()
+    counts = tags[column].value_counts().head(n).sort_values()
+    fig, ax = plt.subplots(figsize=(8, max(3, 0.4 * len(counts))))
+    bars = ax.barh(counts.index, counts.values, color=BAR_COLOR, height=0.7)
+    ax.bar_label(
+        bars, labels=[f"{c}  ({c / tagged_books:.0%})" for c in counts.values],
+        padding=3, color=TEXT_SECONDARY, fontsize=9,
+    )
+    ax.set_xlim(0, counts.max() * 1.25)
+    ax.set_title(title)
+    ax.set_xlabel(f"Books (share of {tagged_books} tagged books)")
+    ax.grid(axis="y", visible=False)
+    ax.xaxis.get_major_locator().set_params(integer=True)
+    fig.tight_layout()
+    return fig
+
+
+def plot_avg_rating_by_tag(read, column, label, min_books):
+    tags = explode_tags(read[read["My Rating"] > 0], column)
+    if tags.empty:
+        return None
+    stats = tags.groupby(column)["My Rating"].agg(["mean", "count"])
+    stats = stats[stats["count"] >= min_books].sort_values("mean").tail(10)
+    if stats.empty:
+        return None
+    fig, ax = plt.subplots(figsize=(8, max(3, 0.4 * len(stats))))
+    bars = ax.barh(stats.index, stats["mean"], color=BAR_COLOR, height=0.7)
+    ax.bar_label(
+        bars, labels=[f"{m:.2f} ({c})" for m, c in zip(stats["mean"], stats["count"])],
+        padding=3, color=TEXT_SECONDARY, fontsize=9,
+    )
+    ax.set_xlim(0, 5.6)
+    ax.set_title(f"Highest rated {label} (≥ {min_books} rated books)")
+    ax.set_xlabel("Average rating (books rated)")
+    ax.grid(axis="y", visible=False)
+    fig.tight_layout()
+    return fig
+
+
+def get_hardcover_token():
+    """Optional free token from hardcover.app/account/api, for mood data."""
+    try:
+        token = st.secrets.get("HARDCOVER_TOKEN")
+    except Exception:  # no secrets.toml
+        token = None
+    return (token or os.environ.get("HARDCOVER_TOKEN") or "").strip() or None
+
+
+def get_book_metadata(read, file_bytes):
+    """Look up genres/moods once per uploaded file; slider changes reuse the result."""
+    file_id = hashlib.md5(file_bytes).hexdigest()
+    cached = st.session_state.get("book_metadata")
+    if cached and cached[0] == file_id:
+        return cached[1], cached[2]
+    bar = st.progress(0.0, text="Looking up genres and moods…")
+    meta, warnings = enrich_books(
+        read, get_hardcover_token(), progress=lambda f, text: bar.progress(f, text=text)
+    )
+    bar.empty()
+    st.session_state["book_metadata"] = (file_id, meta, warnings)
+    return meta, warnings
+
+
 def show(fig, empty_message):
     if fig is None:
         st.info(empty_message)
@@ -199,6 +277,11 @@ read = load_read_books(df)
 if read.empty:
     st.warning("No books on the 'read' shelf were found in this file.")
     st.stop()
+
+meta, lookup_warnings = get_book_metadata(read, uploaded_file.getvalue())
+read = read.join(meta)
+for warning in lookup_warnings:
+    st.warning(warning)
 
 # Optional year filter on when the book was finished
 years = sorted(read["Finished"].dropna().dt.year.astype(int).unique())
@@ -245,6 +328,33 @@ with right:
 
 st.divider()
 
+# Genres and moods (looked up from Hardcover / Open Library)
+st.header("Genres & moods")
+with_genres = read["Genres"].map(len).gt(0).sum()
+with_moods = read["Moods"].map(len).gt(0).sum()
+coverage = f"Genres found for {with_genres} of {len(read)} books, moods for {with_moods}."
+if get_hardcover_token() is None:
+    coverage += (" Moods come from Hardcover: add a free HARDCOVER_TOKEN to"
+                 " .streamlit/secrets.toml to include them.")
+st.caption(coverage)
+
+min_tagged = st.slider("Minimum rated books per genre or mood", 1, 10, 3)
+
+left, right = st.columns(2)
+with left:
+    show(plot_top_tags(read, "Genres", "Most read genres"), "No genre data found for these books.")
+with right:
+    show(plot_avg_rating_by_tag(read, "Genres", "genres", min_tagged), "No genres meet this minimum.")
+
+if with_moods:
+    left, right = st.columns(2)
+    with left:
+        show(plot_top_tags(read, "Moods", "Most common moods"), "No mood data found for these books.")
+    with right:
+        show(plot_avg_rating_by_tag(read, "Moods", "moods", min_tagged), "No moods meet this minimum.")
+
+st.divider()
+
 left, right = st.columns(2)
 with left:
     st.subheader("Longest books")
@@ -260,7 +370,8 @@ with right:
     )
 
 with st.expander("All read books"):
-    st.dataframe(
-        read[["Title", "Author", "My Rating", "Number of Pages", "Original Publication Year", "Date Read"]],
-        hide_index=True,
-    )
+    table = read[["Title", "Author", "My Rating", "Genres", "Moods", "Number of Pages",
+                  "Original Publication Year", "Date Read"]].copy()
+    for col in ["Genres", "Moods"]:
+        table[col] = table[col].map(", ".join)
+    st.dataframe(table, hide_index=True)
