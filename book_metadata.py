@@ -5,6 +5,8 @@ Sources, in order:
      API token, read from HARDCOVER_TOKEN in .streamlit/secrets.toml or the environment.
   2. Open Library (https://openlibrary.org) - subjects mapped to genres. No key needed.
 
+Cover images come from Open Library's cover service (by ISBN, or by title search).
+
 Results are cached in book_metadata_cache.json next to this file, so each book is
 only looked up once. Network failures are never cached, so they are retried next time.
 """
@@ -220,24 +222,35 @@ def openlibrary_isbn_lookup(session, isbns):
 
 
 def openlibrary_title_lookup(session, title, author):
-    """Return subjects for the best title/author match on Open Library."""
+    """Return (subjects, cover id or None) for the best title/author match on Open Library."""
     resp = session.get(
         f"{OPENLIBRARY_URL}/search.json",
-        params={"title": title, "author": author, "fields": "subject", "limit": 1},
+        params={"title": title, "author": author, "fields": "subject,cover_i", "limit": 1},
         headers=HTTP_HEADERS,
         timeout=20,
     )
     resp.raise_for_status()
     docs = resp.json().get("docs") or []
-    return (docs[0].get("subject") or []) if docs else []
+    if not docs:
+        return [], None
+    return docs[0].get("subject") or [], docs[0].get("cover_i")
+
+
+def cover_url(key, entry):
+    """Open Library cover image: by ISBN, else by the cover id a title search found."""
+    if key.startswith("isbn:"):
+        return f"https://covers.openlibrary.org/b/isbn/{key[5:]}-M.jpg"
+    if entry.get("cover_id"):
+        return f"https://covers.openlibrary.org/b/id/{entry['cover_id']}-M.jpg"
+    return None
 
 
 # ---------- main entry point ----------
 
 def enrich_books(books, hardcover_token=None, progress=None):
-    """Add 'Genres' and 'Moods' (lists) for every row of a Goodreads dataframe.
+    """Add 'Genres' and 'Moods' (lists) and a 'Cover' image URL for every row of a Goodreads dataframe.
 
-    Returns (dataframe with Genres/Moods columns aligned to books.index, list of warnings).
+    Returns (dataframe with Genres/Moods/Cover columns aligned to books.index, list of warnings).
     """
     progress = progress or (lambda fraction, text: None)
     warnings = []
@@ -320,9 +333,11 @@ def enrich_books(books, hardcover_token=None, progress=None):
         save_cache(cache)
         step("Looking up genres on Open Library…")
 
-    # 3. Open Library: title/author search for books without an ISBN,
+    # 3. Open Library: title/author search for books without an ISBN (also finds their cover),
     #    and for ISBN books that neither source had genres for
     title_search = ol_title_todo + [
+        k for k in title_keys if k in cache and not cache[k].get("cover_checked")
+    ] + [
         k for k in isbn_keys
         if not cache.get(k, {}).get("genres") and cache.get(k, {}).get("ol_checked")
         and not cache.get(k, {}).get("title_checked")
@@ -331,7 +346,9 @@ def enrich_books(books, hardcover_token=None, progress=None):
     for n, key in enumerate(title_search, 1):
         row = rows_by_key[key]
         try:
-            subjects = openlibrary_title_lookup(session, search_title(row.get("Title", "")), str(row.get("Author", "")))
+            subjects, cover_id = openlibrary_title_lookup(
+                session, search_title(row.get("Title", "")), str(row.get("Author", ""))
+            )
         except (requests.RequestException, ValueError) as e:
             if not any("Open Library" in w for w in warnings):
                 warnings.append(f"Some Open Library lookups failed and will be retried next time ({type(e).__name__}).")
@@ -341,7 +358,9 @@ def enrich_books(books, hardcover_token=None, progress=None):
         genres = normalize_genres(subjects)
         if genres:
             entry.update(genres=genres, source=entry.get("source") or "openlibrary")
-        entry.update(ol_checked=True, title_checked=True)
+        if cover_id:
+            entry["cover_id"] = cover_id
+        entry.update(ol_checked=True, title_checked=True, cover_checked=True)
         cache[key] = entry
         if n % 10 == 0:
             save_cache(cache)
@@ -352,4 +371,5 @@ def enrich_books(books, hardcover_token=None, progress=None):
     result = pd.DataFrame(index=books.index)
     result["Genres"] = keys.map(lambda k: list(cache.get(k, {}).get("genres", [])))
     result["Moods"] = keys.map(lambda k: list(cache.get(k, {}).get("moods", [])))
+    result["Cover"] = keys.map(lambda k: cover_url(k, cache.get(k, {})))
     return result, warnings

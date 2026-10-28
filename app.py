@@ -236,13 +236,17 @@ def plot_avg_rating_by_tag(read, column, label, min_books):
     return rating_chart(tags, "Tag", f"Highest rated {label} (≥ {min_books} rated books)")
 
 
-def book_table(books):
-    """Books as a readable table, with genre and mood lists joined."""
-    table = books[["Title", "Author", "My Rating", "Genres", "Moods", "Number of Pages",
-                   "Original Publication Year", "Date Read"]].copy()
+def show_books(books):
+    """Books as a readable table with cover images, genre and mood lists joined."""
+    # Columns the metadata lookup didn't provide stay empty rather than failing
+    table = books.reindex(columns=["Cover", "Title", "Author", "My Rating", "Genres", "Moods",
+                                   "Number of Pages", "Original Publication Year", "Date Read"])
     for col in ["Genres", "Moods"]:
         table[col] = table[col].map(", ".join)
-    return table
+    st.dataframe(
+        table, hide_index=True, row_height=70,
+        column_config={"Cover": st.column_config.ImageColumn("Cover", width="small")},
+    )
 
 
 def get_hardcover_token():
@@ -258,7 +262,7 @@ def get_book_metadata(read, file_bytes):
     """Look up genres/moods once per uploaded file; slider changes reuse the result."""
     file_id = hashlib.md5(file_bytes).hexdigest()
     cached = st.session_state.get("book_metadata")
-    if cached and cached[0] == file_id:
+    if cached and cached[0] == file_id and "Cover" in cached[1]:
         return cached[1], cached[2]
     bar = st.progress(0.0, text="Looking up genres and moods…")
     meta, warnings = enrich_books(
@@ -279,7 +283,7 @@ def show(chart, empty_message, key):
         i = point["point_index"]
         if i < len(chart.books):  # the selection can outlive a chart redrawn with fewer bars
             st.markdown(f"**{chart.summaries[i]}**")
-            st.dataframe(book_table(chart.books[i]), hide_index=True)
+            show_books(chart.books[i])
 
 
 st.set_page_config(page_title="Reading Stats", layout="wide")
@@ -408,4 +412,4 @@ with right:
     )
 
 with st.expander("All read books"):
-    st.dataframe(book_table(read), hide_index=True)
+    show_books(read)
